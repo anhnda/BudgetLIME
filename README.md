@@ -38,7 +38,6 @@ constructed only inside a driver's `main()` after arguments are supplied.
 | `tier2b_reseed.py` | yes | **Tier 2b — independent-reseeding audit.** Breaks the shared-mask coupling of the nested ladder: at a single fixed `N`, runs `R` independent seeds to measure (A) the cross-seed sign-violation rate vs the `1/pK` target and (B) the stratified Jaccard stability of the certified set above vs inside the unresolved band. Includes a `selftest` mode (pure NumPy, no models). |
 | `tier3_feasibility.py` | no | **Tier 3 — feasibility (Reading 2).** Shows why `K=2` costs *more* despite *lower* noise: moving pairwise structure into the fit lowers `σ_eff`, but `pK` jumps `~ d²/2`, lifting the feasibility floor `~ pK`. Produces the resolution-budget vs feasibility-floor crossing curves. |
 | `baselines.py` | yes | Compares the floor against a per-coordinate bootstrap CI and the single-coordinate Wald interval on the **same** fit and mask bank, isolating the certification criterion. Demonstrates the Wald degeneracy as `σ_obs → 0` that the mismatch term `C_m√m` repairs. |
-| `git.push` | — | Convenience git push snippet. |
 
 ### The two frozen constants (`bl_core.CONSTANTS`)
 
@@ -53,6 +52,8 @@ separate objects: inverting the budget with `C_FLOOR` lands below the feasibilit
 floor and is physically meaningless.
 
 ---
+
+
 
 ## Installation
 
@@ -184,6 +185,12 @@ Exact-β check, NLP `K=2` (enumerable short sentences only):
 ```bash
 python tier2_blackbox.py exact-nlp --K 2 --subset 10 --max_d 13 \
     --sentences text_samples/sst2_short.txt
+```
+
+Visualize
+```bash
+cd visualize
+./visualize.sh
 ```
 
 The Tier-2 report separates the **guarantee** (certified sign flips / checks,
