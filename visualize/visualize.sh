@@ -1,0 +1,1 @@
+python draw_certificate_image.py --image church.JPEG --N_ladder 512 1000 2000 4000
