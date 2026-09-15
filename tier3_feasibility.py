@@ -43,7 +43,7 @@ def measure_sigma_eff(d, K, n_active, m_resid, sigma_obs, N_pilot, n_trials,
         Z, y = sf(N_pilot, sigma_obs, rng=np.random.default_rng(100 + t))
         try:
             m_hat = bl.estimate_mismatch_from_residual(
-                Z, y, K, sigma_obs, cross_fit=(K == 2))
+                Z, y, K, sigma_obs, cross_fit=True)
         except np.linalg.LinAlgError:
             continue
         s_effs.append(bl.sigma_eff(sigma_obs, m_hat))

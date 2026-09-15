@@ -11,8 +11,8 @@ Nothing heavy runs on import: a model is constructed only when a wrapper is
 instantiated inside a driver's main(), honoring the "never auto-run torch"
 preference.
 
-  TextClassifier  : sentence + token-mask  -> class probability  (sigma_obs > 0)
-  ImageClassifier : image   + cell-mask    -> class logit        (sigma_obs ~ 0)
+  TextClassifier  : sentence + token-mask  -> class probability  (deterministic eval)
+  ImageClassifier : image   + cell-mask    -> class logit        (deterministic eval)
 """
 from __future__ import annotations
 import numpy as np

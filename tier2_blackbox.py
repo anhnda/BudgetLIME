@@ -3,8 +3,10 @@ tier2_blackbox.py
 =================
 TIER 2 -- Black-box classifiers (+ an exact-beta sign-correctness check).
 
-Question answered: does the GUARANTEE hold on real query-only models, with the
-constants frozen from Tier 1?
+Question answered: how does the realized two-term floor behave on real
+query-only models, and are certified-in-both signs stable as the budget grows?
+Because exact population coefficients are unavailable here, this tier is a
+stability/consistency study; correctness is tested only by exact enumeration.
 
 Constants are taken from bl_core.CONSTANTS and never re-fit here.
 
@@ -36,11 +38,11 @@ EXACT-BETA SIGN-CORRECTNESS CHECK (the direct forward test).
   (Consequently the 7x7 image grid, d=49, has no exact-beta check; short
   sentences at K=2 do.)
 
-Complementary noise coverage (stated, not incidental):
-  * Image backbones are DETERMINISTIC (sigma_obs ~ 0) -> exercise the MISMATCH
-    half of sigma_eff.
-  * NLP backbones are PROBABILISTIC (sigma_obs > 0) -> exercise the QUERY-NOISE
-    half. Together they cover both terms of sigma_eff on real models.
+Noise model used in the real-model experiments:
+  * Both image and NLP wrappers run in eval/no_grad mode and are deterministic,
+    so sigma_obs_ub = 0 up to numerical reproducibility.
+  * Real-model floors are therefore mismatch-driven. Stochastic query-noise
+    behavior is stress-tested in the synthetic tier.
 
 Honors "never auto-run torch": a backbone is built only inside main() after
 arguments are supplied.
@@ -132,19 +134,37 @@ def _count_nlp_items(sents, refs, backbones, cap=None):
 #  Uniform "probe" adapter: hides the modality behind a single query closure
 # =========================================================================== #
 class Probe:
-    """A single explained instance (sentence or image) under one reference.
+    """A single explained instance under one reference.
 
-    Exposes:
-      d        : number of free interpretable units
-      target   : explained class index
-      query(Z) : (N, d) binary masks -> (N,) model outputs  (the black box)
-      sigma_obs: query-noise scale (0 for deterministic backbones)
+    output_abs_bound:
+        Optional deterministic M with |g(z)| <= M.  NLP probabilities use M=1.
+        It supports a valid population mismatch sup bound and the held-out UCB
+        range.  Logit outputs leave this unset unless the caller supplies a bound.
+
+    B_pop_ub:
+        Optional direct upper bound on ||r_{>K,rho}||_inf.  If absent but
+        output_abs_bound is known, ``probe_B_pop_bound`` derives the generic
+        Parseval bound M(1+sqrt(pK)).
     """
-    def __init__(self, d, target, query_fn, sigma_obs):
+    def __init__(self, d, target, query_fn, sigma_obs,
+                 output_abs_bound=None, B_pop_ub=None):
         self.d = d
         self.target = target
         self.query = query_fn
-        self.sigma_obs = sigma_obs
+        self.sigma_obs = float(sigma_obs)
+        self.output_abs_bound = output_abs_bound
+        self.B_pop_ub = B_pop_ub
+
+
+def probe_B_pop_bound(probe: Probe, K: int):
+    """Return a genuine B_pop upper bound when the probe exposes enough structure."""
+    if probe.B_pop_ub is not None:
+        return float(probe.B_pop_ub)
+    if probe.output_abs_bound is not None:
+        return bl.population_residual_sup_bound(
+            probe.output_abs_bound, probe.d, K
+        )
+    return None
 
 
 def nlp_probe(clf, sentence, reference, max_free):
@@ -154,14 +174,15 @@ def nlp_probe(clf, sentence, reference, max_free):
         return None
     Xb = clf.make_baseline(ctx, reference)
     target = clf.target_class(ctx)
-    # probabilistic backbone: estimate sigma_obs by repeated queries
-    rng = np.random.default_rng(0)
-    Zp = bl.sample_masks(16, d, rng)
-    cols = [clf.query(ctx, Xb, Zp, target) for _ in range(8)]
-    sigma_obs = float(np.stack(cols, 0).std(axis=0).mean())
-    return Probe(d, target,
-                 query_fn=lambda Z: clf.query(ctx, Xb, Z, target),
-                 sigma_obs=sigma_obs)
+
+    # The wrapper uses model.eval() + no_grad(), hence repeated identical masks
+    # are deterministic.  Probability-valued output gives |g(z)| <= 1.
+    return Probe(
+        d, target,
+        query_fn=lambda Z: clf.query(ctx, Xb, Z, target),
+        sigma_obs=0.0,
+        output_abs_bound=1.0,
+    )
 
 
 def image_probe(clf, img, reference, grid):
@@ -170,24 +191,63 @@ def image_probe(clf, img, reference, grid):
     slices = clf._cell_slices(H, W, grid)
     d = len(slices)
     target = clf.target_class(img)
-    # deterministic backbone -> sigma_obs ~ 0; the floor is mismatch-driven
-    return Probe(d, target,
-                 query_fn=lambda Z: clf.query(img, ref, slices, Z, target),
-                 sigma_obs=0.0)
+    # Deterministic logits.  No finite global logit bound is assumed here; a
+    # theorem-level B_pop bound must be supplied separately if required.
+    return Probe(
+        d, target,
+        query_fn=lambda Z: clf.query(img, ref, slices, Z, target),
+        sigma_obs=0.0,
+        output_abs_bound=None,
+    )
 
 
 # =========================================================================== #
 #  Shared per-probe routines (all numerics via bl_core)
 # =========================================================================== #
-def pilot_sigma_eff(probe: Probe, K, seed=0):
-    """Cross-fitted pilot -> sigma_eff (the only data-dependent input)."""
+def _pilot_bank(probe: Probe, K: int, seed: int):
+    """Draw and query the shared pilot bank used by planning/UCB routines."""
     N0 = bl.pilot_N0(probe.d, K)
     rng = np.random.default_rng(seed + 12345)
     Z = bl.sample_masks(max(N0, 3 * bl.p_K(probe.d, K)), probe.d, rng)
     y = probe.query(Z)
-    m_hat = bl.estimate_mismatch_from_residual(Z, y, K, probe.sigma_obs,
-                                               cross_fit=(K == 2))
-    return bl.sigma_eff(probe.sigma_obs, m_hat), m_hat
+    return Z, y
+
+
+def pilot_sigma_eff(probe: Probe, K, seed=0, detail=False):
+    """Cross-fitted PLANNING pilot.
+
+    This retains the empirical difference-of-variances estimator used by the
+    backward budget rule.  It is not the mismatch-energy UCB used for certified
+    forward decisions.
+    """
+    Z, y = _pilot_bank(probe, K, seed)
+    est = bl.estimate_mismatch_detail(
+        Z, y, K, probe.sigma_obs, cross_fit=True
+    )
+    s_eff = bl.sigma_eff(probe.sigma_obs, est.m_hat)
+    if detail:
+        return s_eff, est
+    return s_eff, est.m_hat
+
+
+def pilot_mismatch_ucb(probe: Probe, K, seed=0, delta_pilot=None,
+                       validation_fraction=0.5):
+    """Honest held-out UCB for mismatch energy m, not for sigma_eff.
+
+    For probability-output probes, ``output_abs_bound=1`` yields a conditional
+    validation residual bound automatically.  Logit-valued probes must expose a
+    finite output bound or an explicit R_val at a lower level; otherwise strict
+    UCB certification is intentionally unavailable.
+    """
+    Z, y = _pilot_bank(probe, K, seed)
+    ucb = bl.mismatch_energy_ucb(
+        Z, y, K, d=probe.d, delta_pilot=delta_pilot,
+        validation_fraction=validation_fraction,
+        output_abs_bound=probe.output_abs_bound,
+    )
+    # Optional planning diagnostic only; never fed to the certified floor.
+    s_eff_plan_ucb = bl.sigma_eff(probe.sigma_obs, ucb.m_ucb)
+    return s_eff_plan_ucb, ucb
 
 
 def forward_backward_on_probe(probe: Probe, N_list, beta_min, K, seed=0):
@@ -196,20 +256,48 @@ def forward_backward_on_probe(probe: Probe, N_list, beta_min, K, seed=0):
     N_list = [n for n in N_list if n > bl.p_K(probe.d, K)]
     if len(N_list) < 2:
         return None
-    s_eff, m_hat = pilot_sigma_eff(probe, K, seed)
+    s_eff, est = pilot_sigma_eff(probe, K, seed, detail=True)   # R1.6 detail
+    m_hat = est.m_hat
+    # Use a genuine population sup bound when available (probability-output NLP);
+    # otherwise retain the historical sample residual max as an empirical plug-in
+    # for this stability study.  The latter is not a theorem-level B_pop bound.
+    B_floor = probe_B_pop_bound(probe, K)
+    B_floor = est.B_hat if B_floor is None else B_floor
 
-    # FORWARD: prefix-nested bank, single-budget theorem at each rung
+    # R1.5: is the pilot inside the Bernstein-domination regime at the smallest
+    # budget it will run? (sub-exponential term dominated => C_M absorbs it.)
+    N_min = min(N_list)
+    N_dom = bl.leakage_domination_N(est.m_hat, est.B_hat, probe.d, K)
+    dominated = bool(N_min >= N_dom)
+
+    # FORWARD: prefix-nested bank, single-budget theorem at each rung.
+    # Report point 1/2: pass the mismatch breakdown so each rung's floor is the
+    # revised TWO-TERM certified floor (sigma_obs, m_hat, B) rather than the
+    # absorbed single-scalar sigma_eff.
     N_max = max(N_list)
     rng = np.random.default_rng(seed + 777)
     Zbank = bl.sample_masks(N_max, probe.d, rng)
     ybank = probe.query(Zbank)
-    trace = bl.sweep_prefix_ladder(Zbank, ybank, N_list, s_eff, probe.d, K)
+    trace = bl.sweep_prefix_ladder(Zbank, ybank, N_list, s_eff, probe.d, K,
+                                   sigma_obs=probe.sigma_obs, m_hat=est.m_hat,
+                                   B=B_floor)
 
-    # BACKWARD: predict N, clamp, realized floor
-    plan = bl.plan_budget(s_eff, beta_min, probe.d, K)
+    # BACKWARD: predict N with the empirical planning constant, report the revised
+    # two-term realized floor.
+    plan = bl.plan_budget(
+        s_eff, beta_min, probe.d, K,
+        sigma_obs=probe.sigma_obs, m_hat=est.m_hat, B=B_floor,
+    )
 
     return dict(d=probe.d, pK=bl.p_K(probe.d, K), m_hat=m_hat, sigma_eff=s_eff,
-                sign_flips=trace.sign_flips,                 # THE guarantee
+                m_raw=est.m_raw, m_negative=est.negative,     # R1.6
+                B_hat=est.B_hat, B_floor=B_floor,
+                N_dom=N_dom, dominated=dominated,  # R1.5
+                cest_last=trace.cest_last,                    # R1.4 realized Cest
+                floor_last=trace.floor_last,                  # R1.4 realized floor
+                floor_last_old=trace.floor_last_old,          # R1.4 old frozen floor
+                cert_last=trace.cert_last,                    # certified count (new floor)
+                sign_flips=trace.sign_flips,                 # stability check
                 n_compared=trace.n_compared,                 # its denominator
                 count_monotone=trace.count_monotone,         # diagnostic
                 set_nested=trace.set_nested,                 # diagnostic
@@ -221,15 +309,35 @@ def forward_backward_on_probe(probe: Probe, N_list, beta_min, K, seed=0):
 # =========================================================================== #
 #  Exact-beta sign-correctness: dense OLS on the FULL cube 2^d (d <= MAX_EXACT_D)
 # =========================================================================== #
-def exact_cube(d, rng):
-    """Enumerate ALL 2^d masks (shuffled). Fitting OLS on this gives the EXACT
-    population degree-K projection -- the order is irrelevant to the fit, but we
-    shuffle so a PREFIX (reused for pilot/run) is i.i.d. uniform rather than the
-    structured binary-counting order, which would give a singular pilot Gram."""
+def exact_cube(d, rng=None):
+    """Enumerate ALL 2^d masks (in binary-counting order). Fitting OLS on the
+    full cube gives the EXACT population degree-K projection; the row order is
+    irrelevant to that fit.
+
+    Blocking fix (report point 6): the pre-fix code SHUFFLED the cube and then
+    took a PREFIX for the pilot / deployment run, calling it "i.i.d. uniform".
+    A prefix of a random permutation is sampling WITHOUT replacement, not i.i.d.
+    Bernoulli masks -- it is not the finite-budget experiment Theorem 1 is about.
+    We no longer draw prefixes: the caller enumerates the cube ONCE (this
+    function) to cache g(z), and then draws i.i.d. cube-index samples WITH
+    replacement (iid_from_cube) for each finite-budget run, looking up the cached
+    outputs.  No extra black-box queries are spent.  `rng` is unused now and kept
+    only for signature back-compat.
+    """
     n = 1 << d
     bits = ((np.arange(n)[:, None] >> np.arange(d)[None, :]) & 1).astype(float)
-    rng.shuffle(bits)
     return bits
+
+
+def iid_from_cube(cube_bits, y_cube, N, rng):
+    """Draw N i.i.d.-uniform masks WITH REPLACEMENT from the enumerated cube and
+    return (Z, y) by looking up cached outputs -- an honest finite-budget draw
+    from the uniform product measure at zero extra query cost (report point 6).
+    Sampling cube-row indices uniformly with replacement is exactly i.i.d.
+    Bernoulli(1/2) masks over the d units."""
+    n = cube_bits.shape[0]
+    idx = rng.integers(0, n, size=N)
+    return cube_bits[idx], y_cube[idx]
 
 
 def exact_calls(d):
@@ -238,62 +346,101 @@ def exact_calls(d):
 
 
 def exact_sign_check(probe: Probe, beta_min, K, seed=0):
-    """Direct sign-correctness on ONE small-d probe.
+    """Direct sign-correctness check with exact population beta, m and B.
 
-    Enumerate the cube ONCE (the only model query for this probe); reuse a
-    PREFIX for the pilot (sigma_eff) and the deployment-budget run estimate, and
-    the FULL cube for exact beta. A certified coordinate is scored only if exact
-    beta also resolves it. Returns a dict, or None if d is too large / the run
-    budget is not well-posed.
+    For d <= MAX_EXACT_D we query the full cube once.  Because the current NLP
+    wrappers are deterministic, the full cube gives the exact population
+    degree-K projection and exact mismatch residual under the uniform measure.
+    Finite-budget pilot/run masks are sampled i.i.d. WITH REPLACEMENT from this
+    cached cube, so the finite run matches the theorem's mask law without extra
+    model calls.
+
+    The run floor uses exact m_{>K} and B_pop from the cube.  This makes the
+    enumeration tier a clean direct theorem check rather than a test confounded
+    by a plug-in pilot bound.
     """
     if probe.d > MAX_EXACT_D:
         return None
-    Zc = exact_cube(probe.d, np.random.default_rng(seed + 2))
-    yc = probe.query(Zc)                       # the one expensive call
+    if abs(probe.sigma_obs) > 1e-12:
+        raise ValueError(
+            "exact_sign_check currently assumes deterministic queries "
+            "(sigma_obs=0) so the full cube is exact ground truth"
+        )
+
+    Zc = exact_cube(probe.d)
+    yc = probe.query(Zc)
     Nc = Zc.shape[0]
+    rng = np.random.default_rng(seed + 2)
 
-    # pilot sigma_eff from a prefix
+    # Exact population projection and nuisance quantities from the full cube.
+    beta_exact, b0_exact, _ = bl.ols_fit(Zc, yc, K)
+    r_exact = yc - (b0_exact + bl.design_matrix(Zc, K) @ beta_exact)
+    m_exact = float(np.mean(r_exact ** 2))
+    B_exact = float(np.max(np.abs(r_exact)))
+
+    # Planning pilot remains the empirical deployment heuristic.
     n_pilot = min(max(bl.pilot_N0(probe.d, K), 3 * bl.p_K(probe.d, K)), Nc)
-    m_hat = bl.estimate_mismatch_from_residual(
-        Zc[:n_pilot], yc[:n_pilot], K, probe.sigma_obs, cross_fit=(K == 2))
-    s_eff = bl.sigma_eff(probe.sigma_obs, m_hat)
+    Zp, yp = iid_from_cube(Zc, yc, n_pilot, rng)
+    est_plan = bl.estimate_mismatch_detail(
+        Zp, yp, K, probe.sigma_obs, cross_fit=True
+    )
+    s_eff = bl.sigma_eff(probe.sigma_obs, est_plan.m_hat)
 
-    # deployment-budget run estimate, a prefix of the same cube
-    plan = bl.plan_budget(s_eff, beta_min, probe.d, K)
-    N_run = min(plan.N_run, Nc)
+    # Predict a deployment budget, then simulate an i.i.d. finite run from cache.
+    N_pred = bl.predict_budget(s_eff, beta_min, probe.d, K)
+    N_run = max(N_pred, bl.feasibility_floor(probe.d, K))
     if N_run <= bl.p_K(probe.d, K):
         return None
-    beta_run, _, _ = bl.ols_fit(Zc[:N_run], yc[:N_run], K)
-    fl_run = bl.floor_value(s_eff, probe.d, N_run, K)
+    Zrun, yrun = iid_from_cube(Zc, yc, N_run, rng)
+    beta_run, _, _ = bl.ols_fit(Zrun, yrun, K)
 
-    # EXACT beta on the full cube
-    beta_exact, _, _ = bl.ols_fit(Zc, yc, K)
-    fl_exact = bl.floor_value(s_eff, probe.d, Nc, K)
+    fl_run = bl.certified_floor_from_design(
+        Zrun, K, sigma_obs_ub=0.0, m_ub=m_exact, B_pop_ub=B_exact,
+    )
+    fl_exact = bl.certified_floor_from_design(
+        Zc, K, sigma_obs_ub=0.0, m_ub=m_exact, B_pop_ub=B_exact,
+    )
 
-    n_false, n_scored = bl.false_sign_rate(beta_run, beta_exact,
-                                           fl_run, fl_exact)
-    return dict(d=probe.d, N_run=N_run, cube_N=Nc, n_calls=Nc,
-                n_false_sign=n_false, n_scored=n_scored)
+    n_false, n_scored = bl.false_sign_rate(beta_run, beta_exact, fl_run)
+    pm = bl.power_miss_stats(beta_run, beta_exact, fl_run, fl_exact)
+    return dict(
+        d=probe.d, N_run=N_run, cube_N=Nc, n_calls=Nc,
+        m_exact=m_exact, B_exact=B_exact,
+        n_false_sign=n_false, n_scored=n_scored,
+        n_margin=pm.n_margin,
+        n_margin_recovered=pm.n_margin_recovered,
+        n_margin_miss=pm.n_margin_miss,
+        n_cube_resolvable=pm.n_cube_resolvable,
+        n_cube_recovered=pm.n_cube_recovered,
+        n_cube_miss=pm.n_cube_miss,
+    )
 
 
 # =========================================================================== #
-#  Reporting -- guarantee and diagnostics kept in SEPARATE tables
+#  Reporting -- forward stability, backward planning, and diagnostics
 # =========================================================================== #
 def report_tier2(rows, K, beta_min):
     print("\n" + "=" * 72)
-    print(f"TIER 2 -- guarantee table (K={K}, beta_min={beta_min}). "
-          f"Constants frozen from Tier 1.")
+    print(f"TIER 2 -- forward stability + backward planning "
+          f"(K={K}, beta_min={beta_min}).")
     print("=" * 72)
-    print(f"  {'cell':>22} {'d':>3} {'sig_eff':>8} | "
-          f"{'flips/cmp':>11} | {'BWD ratio':>9} {'clamp':>6}")
+    print(f"  {'cell':>22} {'d':>3} {'sig_eff':>8} {'Cest':>6} {'flr×':>5} | "
+          f"{'flips/cmp':>11} | {'BWD ratio':>9} {'clamp':>6} | "
+          f"{'neg%':>5} {'dom%':>5}")
     flips_total = cmp_total = 0
     for r in rows:
         flips_total += r["sign_flips"]
         cmp_total += r.get("n_compared", 0)
         clamp = "yes" if r["clamped"] else ""
         fc = f"{r['sign_flips']}/{r.get('n_compared', 0)}"
-        print(f"  {r['cell']:>22} {r['d']:>3d} {r['sigma_eff']:>8.4f} | "
-              f"{fc:>11} | {r['ratio']:>9.3f} {clamp:>6}")
+        negp = 100.0 * r.get("neg_frac", 0.0)
+        domp = 100.0 * r.get("dom_frac", 1.0)
+        cest = r.get("cest", float("nan"))
+        infl = r.get("floor_infl", float("nan"))
+        print(f"  {r['cell']:>22} {r['d']:>3d} {r['sigma_eff']:>8.4f} "
+              f"{cest:>6.2f} {infl:>5.2f} | "
+              f"{fc:>11} | {r['ratio']:>9.3f} {clamp:>6} | "
+              f"{negp:>5.0f} {domp:>5.0f}")
     ratios = [r["ratio"] for r in rows]
     rate = flips_total / cmp_total if cmp_total else float("nan")
     print(f"\n  FORWARD  : certified sign flips = {flips_total} / {cmp_total} "
@@ -308,6 +455,34 @@ def report_tier2(rows, K, beta_min):
     print("\n  [appendix diagnostics -- near-guaranteed by prefix "
           "construction, NOT theorem evidence]")
     print(f"    count-monotone: {mono:.1f}%    set-nested: {nest:.1f}%")
+
+    # R1.4 realized-Cest note
+    if rows:
+        cests = [r.get("cest") for r in rows if r.get("cest") == r.get("cest")]
+        infls = [r.get("floor_infl") for r in rows
+                 if r.get("floor_infl") == r.get("floor_infl")]
+        if cests:
+            print("\n  [R1.4 realized floor constant]")
+            print(f"    Cest measured per run from the design (median "
+                  f"{np.median(cests):.2f}, range [{min(cests):.2f}, "
+                  f"{max(cests):.2f}]); NOT the frozen C_FLOOR=1.")
+            print(f"    floor inflation vs old frozen-C_FLOOR floor: median "
+                  f"{np.median(infls):.2f}x (range [{min(infls):.2f}, "
+                  f"{max(infls):.2f}]).")
+            print(f"    The forward floor is now a genuine upper bound; the "
+                  f"certified counts above reflect it.")
+
+    # R1.5 / R1.6 correctness-fix diagnostics
+    if rows:
+        neg = np.mean([r.get("neg_frac", 0.0) for r in rows]) * 100
+        dom = np.mean([r.get("dom_frac", 1.0) for r in rows]) * 100
+        print("\n  [correctness-fix diagnostics]")
+        print(f"    R1.6 negative-clip fraction (raw m_hat<0, then clipped "
+              f"to 0): {neg:.1f}% of items")
+        print(f"         clipping is conservative (raises sigma_eff); nonzero "
+              f"mainly in degenerate/deterministic cells.")
+        print(f"    R1.5 Bernstein-domination: {dom:.1f}% of items run at "
+              f"N >= (2B^2/9m) log(.), sub-exp term dominated.")
 
 
 def report_exact(rows, setting, skipped):
@@ -330,6 +505,38 @@ def report_exact(rows, setting, skipped):
     print(f"  false signs      : {tot_false}")
     print(f"  false-sign rate  : {rate:.4f}   "
           f"(Theorem 1 forward claim, exact ground truth; target 0)")
+
+    # R1.9 -- POWER against the exact projection, split into the guarantee check
+    # (Theorem-1 margin at the RUN floor, must have zero misses) and the
+    # resolution recovery (what the full cube resolves that the run does not --
+    # an expected finite-budget cost, not a violation).
+    n_mar = sum(r.get("n_margin", 0) for r in rows)
+    mar_rec = sum(r.get("n_margin_recovered", 0) for r in rows)
+    mar_miss = sum(r.get("n_margin_miss", 0) for r in rows)
+    n_cube = sum(r.get("n_cube_resolvable", 0) for r in rows)
+    cube_rec = sum(r.get("n_cube_recovered", 0) for r in rows)
+    cube_miss = sum(r.get("n_cube_miss", 0) for r in rows)
+    mar_pow = (mar_rec / n_mar) if n_mar else float("nan")
+    cube_pow = (cube_rec / n_cube) if n_cube else float("nan")
+    print("\n  [R1.9 POWER -- zero false signs is only meaningful with the miss "
+          "rate]")
+    print(f"  (1) GUARANTEE (Theorem-1 margin at the RUN floor: "
+          f"|beta_exact| > 2*fl_run):")
+    print(f"      truth {n_mar:>4d}   recovered {mar_rec:>4d}   "
+          f"MISS {mar_miss:>4d}   power {mar_pow:.3f}")
+    print(f"      -> this is the guarantee denominator; MISS MUST be 0 "
+          f"(the margin promises\n         every such coord clears the run "
+          f"floor). MISS=0 with zero false signs\n         is the theorem "
+          f"holding on exact ground truth.")
+    print(f"  (2) RESOLUTION recovery (vs the full-cube floor: "
+          f"|beta_exact| > fl_exact):")
+    print(f"      cube-resolvable {n_cube:>4d}   run-recovered {cube_rec:>4d}   "
+          f"unresolved {cube_miss:>4d}   power {cube_pow:.3f}")
+    print(f"      -> the full cube (huge N) resolves more than a deployment "
+          f"budget; the gap\n         is the honest finite-budget resolution "
+          f"cost ('below-floor = unresolved,\n         not zero'), NOT a "
+          f"guarantee violation. A low number here means the run\n         "
+          f"budget was small relative to what the reference could support.")
 
 
 # =========================================================================== #
@@ -473,6 +680,7 @@ def _aggregate_cells(rows):
         cells.setdefault(r["cell"], []).append(r)
     out = []
     for cell, rs in cells.items():
+        n = len(rs)
         out.append(dict(
             cell=cell, d=int(np.median([r["d"] for r in rs])),
             sigma_eff=float(np.mean([r["sigma_eff"] for r in rs])),
@@ -482,6 +690,22 @@ def _aggregate_cells(rows):
             clamped=any(r["clamped"] for r in rs),
             count_monotone=float(np.mean([r["count_monotone"] for r in rs])),
             set_nested=float(np.mean([r["set_nested"] for r in rs])),
+            # R1.4: realized Cest and floor inflation vs the old frozen-C_FLOOR
+            cest=float(np.median([r.get("cest_last", float("nan")) for r in rs])),
+            floor_infl=float(np.median(
+                [ (r["floor_last"] / r["floor_last_old"])
+                  for r in rs
+                  if r.get("floor_last_old") ])) if rs else float("nan"),
+            # R1.6: fraction of pilot draws whose RAW mismatch was negative
+            # (clipped to 0). Nonzero mainly in near-degenerate / deterministic
+            # cells, exactly the conditional-clause mechanism of Theorem 1.
+            n_items=n,
+            neg_frac=float(np.mean([1.0 if r.get("m_negative") else 0.0
+                                    for r in rs])),
+            # R1.5: fraction of items inside the Bernstein-domination regime at
+            # the smallest run budget (sub-exponential term dominated).
+            dom_frac=float(np.mean([1.0 if r.get("dominated", True) else 0.0
+                                    for r in rs])),
         ))
     return out
 

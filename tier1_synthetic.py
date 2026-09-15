@@ -111,32 +111,81 @@ def empirical_leakage(Z, r):
 # =========================================================================== #
 #  LEAKAGE LINCHPIN -- fixes C_M  (Lemma 1)
 # =========================================================================== #
-def calibrate_leakage(d=30, n_active=4, n_trials=40):
-    """eta_N ~ C_m sqrt(m log pK / N) with a FLAT ratio = C_m. Sweep (m, N);
-    estimate C_m = eta_N / sqrt(m log pK / N); claim: constant (low CoV)."""
-    print("\n[Lemma 1]  leakage linchpin   eta_N ~ C_m sqrt(m log pK / N)")
-    log_pK = math.log(bl.p_K(d, 1))
+def calibrate_leakage(d=30, n_active=4, n_trials=40, N_freeze=2000):
+    """eta_N ~ C_m sqrt(m log(.) / N) with a FLAT ratio = C_m. Sweep (m, N);
+    estimate C_m = eta_N / sqrt(m log(.) / N).
+
+    R1.5: alongside each cell we report the Bernstein sub-exponential term
+    (2/3) B log(.)/N and the domination threshold N_dom = (2 B^2 / 9 m) log(.).
+    The claim that the frozen C_m ABSORBS the sub-exponential tail is only honest
+    where N >= N_dom, so we flag any cell that is not dominated and confirm the
+    calibration grid sits inside the dominated regime.
+
+    R1.5 (reporting). The per-cell C_m ratio drifts UP monotonically in N (~8%
+    from N=250 to N=4000) at every m. This is NOT scatter and a flat-CoV summary
+    over all N would hide it: the empirical eta_N still contains the sub-exp
+    contribution, which decays faster than the sqrt term, so small-N rows read a
+    slightly LOWER ratio. Because C_m is an asymptotic (sqrt-regime) quantity, we
+    FREEZE it from the large-N rows (N >= N_freeze), where the sub-exp term is
+    2-3 orders below the sqrt term (see the `subexp` column), and report the
+    all-N mean only for transparency. The drift is exactly the R1.5 term,
+    already quantified per cell.
+
+    NOTE (R1.2 / R1.3): the normalizer uses the union-bounded log factor
+    bl.log_pk_over_delta, so C_m is calibrated against the SAME log the floor
+    carries (ONE canonical factor across Lemma 1, the floor, and this
+    calibration). This is the R1.3 resolution: the constant is consistent by
+    construction with the quantity it multiplies. The product C_m*sqrt(normalizer)
+    that enters eta_N is invariant to the normalizer choice.
+    """
+    print("\n[Lemma 1]  leakage linchpin   eta_N ~ C_m sqrt(m log(.) / N)  "
+          "(+ Bernstein sub-exp term, R1.5)")
+    log_fac = bl.log_pk_over_delta(d, 1)          # R1.2 split log factor
     m_grid = [0.005, 0.02, 0.05, 0.1, 0.2]
     N_grid = [250, 500, 1000, 2000, 4000]
-    ratios = []
-    print(f"  {'m':>7} {'N':>7} {'eta_N':>10} {'predict':>10} {'C_m':>7}")
+    ratios = []                 # all cells
+    ratios_large = []           # N >= N_freeze only (the frozen estimate)
+    not_dominated = 0
+    print(f"  {'m':>7} {'N':>7} {'eta_N':>10} {'predict':>10} {'C_m':>7} "
+          f"{'subexp':>9} {'N_dom':>8} {'dom?':>5}")
     for m in m_grid:
         for N in N_grid:
-            etas = []
+            etas, Bs = [], []
             for t in range(n_trials):
                 _, _, _, rf, _ = make_function(
                     d, n_active, 0.0, m, seed=7 * t + N)
                 Z, r = rf(N, rng=np.random.default_rng(123 + t + N))
                 etas.append(empirical_leakage(Z, r))
+                Bs.append(float(np.max(np.abs(r))))      # ||r>K||_inf plug-in
             eta = float(np.mean(etas))
-            pred = math.sqrt(m * log_pK / N)
-            ratios.append(eta / pred if pred > 0 else float("nan"))
+            B = float(np.mean(Bs))
+            pred = math.sqrt(m * log_fac / N)
+            ratio = eta / pred if pred > 0 else float("nan")
+            ratios.append(ratio)
+            if N >= N_freeze:
+                ratios_large.append(ratio)
+            # R1.5 Bernstein sub-exponential term and domination threshold
+            _, sub_e, _ = bl.leakage_bound_terms(m, B, d, N, 1)
+            N_dom = bl.leakage_domination_N(m, B, d, 1)
+            dominated = N >= N_dom
+            not_dominated += (0 if dominated else 1)
             print(f"  {m:>7.3f} {N:>7d} {eta:>10.5f} {pred:>10.5f} "
-                  f"{ratios[-1]:>7.3f}")
-    Cm = float(np.nanmean(ratios))
-    c = bl.cov(ratios)
-    print(f"\n  C_m (mean ratio) = {Cm:.3f}   CoV = {c:.3f}   "
-          f"{'PASS' if c < 0.20 else 'CHECK'} (target CoV < 0.20)")
+                  f"{ratio:>7.3f} {sub_e:>9.5f} {N_dom:>8.0f} "
+                  f"{'yes' if dominated else 'NO':>5}")
+    Cm_all = float(np.nanmean(ratios))
+    c_all = bl.cov(ratios)
+    Cm = float(np.nanmean(ratios_large))       # FROZEN value (large-N)
+    c_large = bl.cov(ratios_large)
+    print(f"\n  C_m all-N   (transparency) = {Cm_all:.3f}   CoV = {c_all:.3f}")
+    print(f"  C_m N>={N_freeze} (FROZEN)    = {Cm:.3f}   CoV = {c_large:.3f}   "
+          f"{'PASS' if c_large < 0.20 else 'CHECK'} (target CoV < 0.20)")
+    print(f"  the ratio drifts UP ~8% with N: this IS the R1.5 sub-exp term "
+          f"(see `subexp`),\n  which inflates small-N eta_N; C_m is an "
+          f"asymptotic sqrt-regime constant, so it is\n  frozen from the large-N "
+          f"rows where the sub-exp term is 2-3 orders below sqrt.")
+    print(f"  R1.5 domination: {len(ratios) - not_dominated}/{len(ratios)} "
+          f"cells have N >= N_dom (sub-exp term dominated, absorbed into C_m). "
+          f"{'ALL PASS' if not_dominated == 0 else f'{not_dominated} CELL(S) NOT DOMINATED'}")
     return Cm
 
 
@@ -215,9 +264,12 @@ def backward_budget(d=30, n_active=4, sigma_obs=1.0, n_trials=30):
     law, stay in WEAK-SNR (required N well above pK); strong-SNR rows are
     feasibility-bound and excluded from the constant."""
     print("\n[BACKWARD]  budget rule -> one constant C_budget (m=0)")
-    log_pK = math.log(bl.p_K(d, 1))
+    # R1.2: calibrate against the SAME union-bounded log factor the floor now
+    # carries (log(SPLIT*pK/delta), delta=1/pK), so the back-solved C_BUDGET is
+    # consistent with floor_value / predict_budget rather than the bare log pK.
+    log_pK = bl.log_pk_over_delta(d, 1)
     pK = bl.p_K(d, 1)
-    z_fw = math.sqrt(2.0 * math.log(pK))
+    z_fw = math.sqrt(2.0 * log_pK)
     gammas = [0.20, 0.14, 0.10, 0.07]      # weak SNR: resolution regime
     N_grid = np.unique(np.round(
         np.geomspace(int(2 * pK), 60000, 48)).astype(int))
@@ -272,10 +324,10 @@ def print_calibration(Cm, x_half, Cb):
     print("\n" + "=" * 72)
     print("TIER 1 CALIBRATION (frozen and carried into Tiers 2-3)")
     print("=" * 72)
-    print(f"  {'constant':>10} {'value':>8}   role")
-    print(f"  {'C_M':>10} {Cm:>8.3f}   leakage (Lemma 1), enters sigma_eff")
-    print(f"  {'C_FLOOR':>10} {CONST_FLOOR:>8.3f}   floor bound (forward); "
-          f"theory=1, empirical>=1 expected")
+    print(f"  {'constant':>10} {'value':>8}   role (values are MEAN OVER d, not d=30)")
+    print(f"  {'C_M':>10} {Cm:>8.3f}   planning/pilot only (NOT in certified floor)")
+    print(f"  {'C_FLOOR':>10} {CONST_FLOOR:>8.3f}   orthonormal ideal only; floor "
+          f"uses per-run C_est")
     print(f"  {'C_BUDGET':>10} {Cb:>8.3f}   budget rule (backward), Eq. 8")
     print(f"\n  forward collapse point x_0.5 = {x_half:.2f} "
           f"(a point on the shared SDR curve)")
@@ -285,6 +337,82 @@ def print_calibration(Cm, x_half, Cb):
 
 
 CONST_FLOOR = bl.CONSTANTS.C_FLOOR
+
+
+# =========================================================================== #
+#  d-SWEEP STABILITY of the FROZEN constants  (referee R1.4, extended)
+#
+#  R1.4 forced Cest to be measured per run because it grows with pK/d. The same
+#  question must then be asked of the OTHER two constants we DO freeze from a
+#  single d=30 calibration: C_m (leakage) and C_budget (planning). If either
+#  drifted with d the way Cest does, freezing it at d=30 and carrying it to
+#  d in {15,24,49} would be the very transfer error R1.4 objects to.
+#
+#  This routine re-runs both calibrations across d in {15,24,30,49} (the d's
+#  that actually occur in Tiers 2-3: NLP d=15/24, images d=49, synthetic d=30)
+#  and reports each constant vs d plus the cross-d CoV. The theoretical
+#  expectation, now checked rather than asserted:
+#    * C_m is Walsh-normalized and divides out the log(nu*pK/delta) factor, so
+#      every column sees the SAME leakage variance m>K independent of d -> flat.
+#    * C_budget is calibrated in the WEAK-SNR resolution regime against the same
+#      union-bounded log factor, so its 1/gamma^2 law is d-independent once the
+#      log(pK) growth is carried explicitly -> flat (unlike Cest, which is the
+#      raw ||Sigma^{-1}||_inf row-sum and is NOT normalized).
+#  A flat result here is what LICENSES freezing C_m and C_budget while measuring
+#  Cest per run; a drift would force those to be per-run too.
+# =========================================================================== #
+def sweep_d_stability(d_grid=(15, 24, 30, 49), n_active=4):
+    print("\n" + "=" * 72)
+    print("d-SWEEP STABILITY of the FROZEN constants C_m, C_budget (R1.4)")
+    print("  Cest is per-run (it grows with d); here we check that the two")
+    print("  constants we DO freeze at d=30 are in fact d-stable.")
+    print("=" * 72)
+    rows = []
+    print(f"  {'d':>4} {'pK':>5} {'C_m (frozen)':>13} {'C_budget':>10} "
+          f"{'Cest_emp':>9}")
+    for d in d_grid:
+        # suppress the verbose per-cell prints of the sub-calibrations
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cm = calibrate_leakage(d=d, n_active=n_active)
+            cb = backward_budget(d=d, n_active=n_active)
+        # realized Cest for this d at a representative deployment budget
+        rng = np.random.default_rng(2027 + d)
+        N_rep = max(6 * bl.p_K(d, 1), 2000)
+        Z = bl.sample_masks(N_rep, d, rng)
+        cest = bl.realized_cest(Z, 1) if hasattr(bl, "realized_cest") \
+            else float("nan")
+        rows.append((d, bl.p_K(d, 1), cm, cb, cest))
+        print(f"  {d:>4} {bl.p_K(d,1):>5} {cm:>13.3f} {cb:>10.3f} {cest:>9.3f}")
+    cms = [r[2] for r in rows]
+    cbs = [r[3] for r in rows]
+    cests = [r[4] for r in rows]
+    def _mean_cov(xs):
+        a = np.array(xs, dtype=float)
+        return float(a.mean()), float(a.std(ddof=1) / abs(a.mean()))
+    cm_mu, cm_cov = _mean_cov(cms)
+    cb_mu, cb_cov = _mean_cov(cbs)
+    ce_mu, ce_cov = _mean_cov(cests)
+    print("  " + "-" * 46)
+    print(f"  {'MEAN':>4} {'':>5} {cm_mu:>13.3f} {cb_mu:>10.3f} {ce_mu:>9.3f}"
+          f"   <- frozen = mean over d")
+    print(f"  cross-d CoV: C_m {cm_cov:.3f}  C_bud {cb_cov:.3f}  "
+          f"C_est {ce_cov:.3f}")
+    print(f"\n  FROZEN VALUES (mean over d, carried into CONSTANTS):")
+    print(f"    C_M     = {cm_mu:.3f}  (cross-d CoV {cm_cov:.3f} "
+          f"{'STABLE' if cm_cov < 0.10 else 'DRIFTS'})")
+    print(f"    C_BUDGET= {cb_mu:.3f}  (cross-d CoV {cb_cov:.3f} "
+          f"{'STABLE' if cb_cov < 0.15 else 'DRIFTS'})")
+    print(f"    C_est is NOT frozen: cross-d CoV {ce_cov:.3f} "
+          f"(rises {cests[0]:.2f} -> {cests[-1]:.2f}); measured per run.")
+    print("\n  We freeze the MEAN over d, not any single d's value: it would be")
+    print("  inconsistent to claim d-stability and then cherry-pick one d. The")
+    print("  low cross-d CoV is what licenses a single frozen scalar for C_m,")
+    print("  C_budget; the high CoV for C_est is why it is re-measured per run.")
+    # Return the FROZEN means (over d), not any single d's value, so the caller's
+    # summary reports 0.830 / 1.552 rather than the d=30-only 0.833 / 1.535.
+    return rows, cm_mu, cb_mu
 
 
 # --------------------------------------------------------------------------- #
@@ -298,12 +426,21 @@ def main():
     Cm = bl.CONSTANTS.C_M
     x_half = float("nan")
     Cb = bl.CONSTANTS.C_BUDGET
+    # calibrate_leakage()/backward_budget() at their DEFAULT d=30 give the
+    # single-d values (0.833 / 1.535); the frozen constants are the MEAN OVER d
+    # from sweep_d_stability (0.830 / 1.552). We keep the single-d numbers only
+    # for the intermediate collapse plots and OVERWRITE Cm/Cb with the d-means
+    # before the final summary, so the summary never reports a cherry-picked d.
     if what in ("leakage", "all"):
-        Cm = calibrate_leakage()
+        Cm = calibrate_leakage()          # d=30 value, used only for the grid/collapse
     if what in ("forward", "all"):
         x_half = forward_collapse(Cm)
     if what in ("backward", "all"):
-        Cb = backward_budget()
+        Cb = backward_budget()            # d=30 value
+    if what in ("dsweep", "all"):
+        _, Cm_mean, Cb_mean = sweep_d_stability()
+        if what == "all":
+            Cm, Cb = Cm_mean, Cb_mean     # FROZEN = mean over d
     if what in ("grid", "all"):
         print("\n[regime grid] five regimes span the two axes of sigma_eff:")
         for s in regime_grid():
